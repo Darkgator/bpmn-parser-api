@@ -70,8 +70,8 @@ def parse_bpmn_xml(xml_content):
     if not all_processes:
         return {'error': 'No BPMN process found in XML'}, 400
     
-    # FILTER: Only keep processes that have actual content (not just Bizagi headers)
-    element_types = [
+    # Element types to search for
+    element_types_for_filter = [
         'startEvent', 'endEvent', 'intermediateThrowEvent', 'intermediateCatchEvent',
         'boundaryEvent', 'task', 'userTask', 'serviceTask', 'manualTask', 
         'scriptTask', 'businessRuleTask', 'sendTask', 'receiveTask',
@@ -79,20 +79,19 @@ def parse_bpmn_xml(xml_content):
         'eventBasedGateway', 'complexGateway', 'subProcess', 'callActivity'
     ]
     
-    # Filter valid processes (those with at least 1 element OR isExecutable="true")
+    # Filter valid processes - count ALL elements recursively
     valid_processes = []
     for proc in all_processes:
         is_executable = proc.get('isExecutable', 'false').lower() == 'true'
-        has_elements = False
         
-        # Check if process has any real elements
-        for elem_type in element_types:
-            if proc.find(f'.//bpmn:{elem_type}', NS) is not None or proc.find(f'.//bpmn2:{elem_type}', NS) is not None:
-                has_elements = True
-                break
+        # Count ALL elements recursively (using .// for deep search)
+        element_count = 0
+        for elem_type in element_types_for_filter:
+            elements_found = proc.findall(f'.//bpmn:{elem_type}', NS) + proc.findall(f'.//bpmn2:{elem_type}', NS)
+            element_count += len(elements_found)
         
-        # Keep process if it's executable OR has elements
-        if is_executable or has_elements:
+        # Keep process if it's executable OR has ANY elements
+        if is_executable or element_count > 0:
             valid_processes.append(proc)
     
     if not valid_processes:
@@ -105,10 +104,18 @@ def parse_bpmn_xml(xml_content):
     result['title'] = first_process.get('name', 'Unnamed Process')
     result['objective'] = extract_documentation(first_process)
     
+    # Track seen process IDs to avoid duplicates
+    seen_process_ids = set()
+    
     # Process each VALID process
     for proc_idx, process in enumerate(processes):
         process_id = process.get('id')
         process_name = process.get('name', f'Process {proc_idx + 1}')
+        
+        # Skip duplicate process IDs
+        if process_id in seen_process_ids:
+            continue
+        seen_process_ids.add(process_id)
         
         result['processes'].append({
             'id': process_id,
@@ -128,8 +135,8 @@ def parse_bpmn_xml(xml_content):
                     if node_id:
                         result['lanes'][node_id] = lane_name
         
-        # Extract all elements from this process
-        for elem_type in element_types:
+        # Extract all elements from this process (RECURSIVE SEARCH)
+        for elem_type in element_types_for_filter:
             for elem in process.findall(f'.//bpmn:{elem_type}', NS) + process.findall(f'.//bpmn2:{elem_type}', NS):
                 elem_id = elem.get('id')
                 if not elem_id:
@@ -156,7 +163,7 @@ def parse_bpmn_xml(xml_content):
                 if event_defs:
                     result['elements'][elem_id]['eventDefinitions'] = event_defs
         
-        # Extract sequence flows from this process
+        # Extract sequence flows from this process (RECURSIVE)
         for flow in process.findall('.//bpmn:sequenceFlow', NS) + process.findall('.//bpmn2:sequenceFlow', NS):
             flow_id = flow.get('id')
             if not flow_id:
@@ -175,7 +182,7 @@ def parse_bpmn_xml(xml_content):
             if condition is not None and condition.text:
                 result['flows'][flow_id]['condition'] = condition.text.strip()
         
-        # Extract data stores from this process
+        # Extract data stores from this process (RECURSIVE)
         for data_store in process.findall('.//bpmn:dataStoreReference', NS) + process.findall('.//bpmn2:dataStoreReference', NS):
             store_id = data_store.get('id')
             if store_id:
@@ -185,7 +192,7 @@ def parse_bpmn_xml(xml_content):
                     'dataStoreRef': data_store.get('dataStoreRef', '')
                 }
         
-        # Extract data objects from this process
+        # Extract data objects from this process (RECURSIVE)
         for data_obj in process.findall('.//bpmn:dataObjectReference', NS) + process.findall('.//bpmn2:dataObjectReference', NS):
             obj_id = data_obj.get('id')
             if obj_id:
@@ -195,9 +202,11 @@ def parse_bpmn_xml(xml_content):
                     'dataObjectRef': data_obj.get('dataObjectRef', '')
                 }
         
-        # Extract data input/output associations
-        for task_elem in process.findall('.//*[@id]', NS):
+        # Extract data input/output associations (RECURSIVE on all elements)
+        for task_elem in process.findall('.//*', NS):
             task_id = task_elem.get('id')
+            if not task_id:
+                continue
             
             # Data input associations
             for data_input_assoc in task_elem.findall('.//bpmn:dataInputAssociation', NS) + task_elem.findall('.//bpmn2:dataInputAssociation', NS):
@@ -225,7 +234,7 @@ def parse_bpmn_xml(xml_content):
                         'source': source_ref
                     })
         
-        # Extract text annotations
+        # Extract text annotations (RECURSIVE)
         for annotation in process.findall('.//bpmn:textAnnotation', NS) + process.findall('.//bpmn2:textAnnotation', NS):
             text_elem = annotation.find('bpmn:text', NS) or annotation.find('bpmn2:text', NS)
             if text_elem is not None and text_elem.text:
@@ -246,6 +255,15 @@ def parse_bpmn_xml(xml_content):
                     'text': text_elem.text.strip(),
                     'associated_element': associated_elem
                 })
+    
+    # Extract data stores at ROOT level (Bizagi often creates them here)
+    for data_store in root.findall('.//bpmn:dataStore', NS) + root.findall('.//bpmn2:dataStore', NS):
+        store_id = data_store.get('id')
+        if store_id and store_id not in result['data_stores']:
+            result['data_stores'][store_id] = {
+                'name': data_store.get('name', 'Unnamed Data Store'),
+                'type': 'dataStore'
+            }
     
     # Build chronological flow order (from all VALID processes)
     start_events = [eid for eid, elem in result['elements'].items() 
